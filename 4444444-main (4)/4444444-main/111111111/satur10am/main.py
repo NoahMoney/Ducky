@@ -20,6 +20,7 @@ import traceback
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from arb.event_filter import EventDrivenFilter
 from arb.multi_hop_engine import run_strategy
 from config.loader import load_bot_config, load_tokens_config
 from universe import UniverseManager
@@ -90,6 +91,7 @@ async def block_aligned_loop(
     execution_cfg: Dict[str, object],
     pair_listener: Optional[PairEventListener],
     mempool_listener: Optional[MempoolListener],
+    event_filter: Optional[EventDrivenFilter],
 ) -> None:
 
     logger = logging.getLogger(__name__)
@@ -165,6 +167,7 @@ async def block_aligned_loop(
                 telegram_notifier,
                 route_performance,
                 {},
+                event_filter,
             )
 
             executor.dry_run_default = original_dry_run
@@ -238,6 +241,8 @@ async def async_main() -> None:
     risk_limits_cfg = cfg.get("risk_limits", {})
     multi_hop_cfg = cfg.get("multi_hop", {})
     telemetry_cfg = cfg.get("telemetry", {})
+    event_filter_cfg = cfg.get("event_filter", {}) or {}
+    data_filter_cfg = cfg.get("data_filter", {}) or {}
 
     # ----------------------------
     # RPC manager
@@ -292,6 +297,7 @@ async def async_main() -> None:
     # ==================================================================
     pair_listener = None
     mempool_listener = None
+    event_filter = None
 
     pnl_store = PnLStore(cfg.get("pnl_store_path"))
     risk_limits_obj = RiskLimits(risk_limits_cfg, pnl_store)
@@ -307,6 +313,23 @@ async def async_main() -> None:
         route_performance=route_performance,
     )
     risk_manager = RiskManager(risk_cfg)
+
+    if event_filter_cfg.get("enabled", True):
+        try:
+            event_filter = EventDrivenFilter(
+                rpc=rpc,
+                registry=registry,
+                dex_configs=filtered_dexes_cfg,
+                strategy_cfg=strategy_cfg,
+                config={**event_filter_cfg, **data_filter_cfg},
+            )
+            await event_filter.start()
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "[event-filter] Failed to start event filter; falling back to brute-force (%s)",
+                exc,
+            )
+            event_filter = None
 
     # ==================================================================
     # LOOP CONFIG
@@ -340,6 +363,7 @@ async def async_main() -> None:
         execution_cfg,
         pair_listener,
         mempool_listener,
+        event_filter,
     )
 
 
