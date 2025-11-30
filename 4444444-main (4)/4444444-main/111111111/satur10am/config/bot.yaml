@@ -1,0 +1,43 @@
+# Sample configuration for the refactored arbitrage bot
+chain: bsc
+execution:
+  enabled: false
+strategy:
+  min_profit_bps: 1.0
+  data_filter:
+    mode: event
+
+# Minimal token + pair universe for local testing
+# Replace with on-chain data for production.
+tokens:
+  0xTokenA:
+    symbol: TKNA
+    decimals: 18
+  0xTokenB:
+    symbol: TKNB
+    decimals: 18
+
+pairs:
+  - address: 0xPair1
+    dex: dexA
+    token0: 0xTokenA
+    token1: 0xTokenB
+    reserve0: 1000000000000000000000
+    reserve1: 1000000000000000000000
+    fee_bps: 25
+  - address: 0xPair2
+    dex: dexB
+    token0: 0xTokenA
+    token1: 0xTokenB
+    reserve0: 900000000000000000000
+    reserve1: 1100000000000000000000
+    fee_bps: 25
+
+event_filter:
+  enabled: true
+  mode: event
+  min_price_change_pct: 0.05
+  max_candidates_per_tick: 50
+  candidate_queue_limit: 500
+  candidate_dedup_window_ms: 1500
+  poll_interval_ms: 1200
