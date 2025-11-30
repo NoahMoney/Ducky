@@ -37,6 +37,7 @@ from typing import Dict, Iterable, List, Set, Optional, Tuple
 
 from arb.arb_quote_service import get_path_quote
 from arb.bellman import build_log_price_graph, find_negative_cycles
+from arb.event_filter import CandidatePool
 from core.models import Pair
 from core.rpc_manager import RPCManager
 from discovery.registry import Registry
@@ -462,6 +463,7 @@ def run_strategy(
     telegram_notifier: Optional[TelegramNotifier] = None,
     route_performance: Optional[RoutePerformance] = None,
     performance_cfg: Optional[Dict[str, object]] = None,
+    event_filter=None,
 ) -> None:
     """Run a single tick of the multi-hop arbitrage strategy.
 
@@ -518,6 +520,24 @@ def run_strategy(
     mempool_min_notional_usd = float(mempool_cfg.get("min_notional_usd", 1000))
     mempool_log_risky = bool(mempool_cfg.get("log_risky_pools", True))
     pending_impact_threshold = float(mh_cfg.get("mempool", {}).get("impact_threshold_pct", 0))
+
+    data_filter_cfg = (mh_cfg.get("data_filter") or strategy_cfg.get("data_filter") or {})
+    event_filter_cfg = mh_cfg.get("event_filter", {}) or {}
+    filter_mode = str(data_filter_cfg.get("mode", event_filter_cfg.get("mode", "event"))).lower()
+    max_candidates_per_tick = int(
+        data_filter_cfg.get(
+            "max_candidates_per_tick",
+            event_filter_cfg.get("max_candidates_per_tick", 100),
+        )
+    )
+    min_validation_spread_bps = float(
+        data_filter_cfg.get(
+            "min_validation_spread_bps",
+            event_filter_cfg.get("min_validation_spread_bps", strategy_cfg.get("min_profit_bps", 0)),
+        )
+    )
+    fallback_on_empty = str(data_filter_cfg.get("fallback_on_empty", "bruteforce")).lower()
+    event_candidates: List[CandidatePool] = []
 
     def mempool_should_prune(pair, cycle_tokens: List[str]) -> bool:
         if mempool_watcher is None or mempool_mode == "off":
@@ -663,6 +683,29 @@ def run_strategy(
         print(f"[multi_hop:{chain}] Base token {base_token} missing from registry metadata")
         return
 
+    candidate_tokens_from_events: Set[str] = set()
+    if filter_mode == "event":
+        if event_filter is None or not getattr(event_filter, "enabled", False):
+            log.warning(
+                "[event-filter] Event-driven mode requested but filter unavailable; falling back to brute-force"
+            )
+            filter_mode = "bruteforce"
+        else:
+            event_candidates = event_filter.get_candidates(max_candidates_per_tick)
+            if event_candidates:
+                for cand in event_candidates:
+                    candidate_tokens_from_events.add(cand.token0.lower())
+                    candidate_tokens_from_events.add(cand.token1.lower())
+                log.info(
+                    "[event-filter] Received %d Swap-driven candidates for validation",
+                    len(event_candidates),
+                )
+            elif fallback_on_empty == "bruteforce":
+                log.info(
+                    "[event-filter] No Swap-driven candidates this tick; using brute-force fallback"
+                )
+                filter_mode = "bruteforce"
+
     # Multi-hop graph configuration
     use_universe_tokens = bool(mh_cfg.get("use_universe_tokens", True))
     # Limit the dynamic token universe used for both path enumeration and
@@ -737,6 +780,23 @@ def run_strategy(
             _add_graph_addr(addr)
 
     _add_graph_addr(base_addr)
+
+    if filter_mode == "event" and candidate_tokens_from_events:
+        allowed_tokens = set(candidate_tokens_from_events) | set(anchor_addrs)
+        if base_addr:
+            allowed_tokens.add(base_addr)
+        filtered_graph_tokens = [addr for addr in graph_token_addrs if addr in allowed_tokens]
+        if filtered_graph_tokens:
+            log.info(
+                "[event-filter] Graph tokens constrained from %d to %d based on Swap candidates",
+                len(graph_token_addrs),
+                len(filtered_graph_tokens),
+            )
+            graph_token_addrs = filtered_graph_tokens
+        else:
+            log.info(
+                "[event-filter] Candidate filter produced no overlap; retaining existing token universe"
+            )
 
     anchor_set = set(anchor_addrs)
     anchors_in_graph = len([addr for addr in graph_token_addrs if addr in anchor_set])
@@ -819,6 +879,81 @@ def run_strategy(
             decimals_by_symbol[sym] = dec
             symbol_by_addr[lower] = sym
             decimals_by_addr[lower] = dec
+
+    validated_event_tokens: Set[str] = set()
+
+    def _validate_event_candidates() -> List[CandidatePool]:
+        validated: List[CandidatePool] = []
+        for cand in event_candidates:
+            dec0 = decimals_by_addr.get(cand.token0.lower())
+            dec1 = decimals_by_addr.get(cand.token1.lower())
+            if dec0 is None or dec1 is None:
+                log.info(
+                    "[event-filter] Candidate rejected (missing decimals) pair=%s/%s",
+                    cand.token0,
+                    cand.token1,
+                )
+                continue
+            prices: List[tuple[str, Decimal]] = []
+            for dex_name in active_dexes:
+                eff = registry.get_effective_reserves(cand.token0, cand.token1, dex_name)
+                if eff is None:
+                    continue
+                pair, res0, res1, _ = eff
+                if res0 <= 0 or res1 <= 0:
+                    continue
+                res_in, res_out = res0, res1
+                dec_in_use, dec_out_use = dec0, dec1
+                if pair.token0.lower() != cand.token0.lower():
+                    res_in, res_out = res1, res0
+                    dec_in_use, dec_out_use = dec1, dec0
+                num = Decimal(res_out) / (Decimal(10) ** dec_out_use)
+                den = Decimal(res_in) / (Decimal(10) ** dec_in_use)
+                if den <= 0:
+                    continue
+                prices.append((dex_name, num / den))
+
+            if len(prices) < 2:
+                log.info(
+                    "[event-filter] Candidate rejected (no cross-DEX coverage) pair=%s/%s",
+                    cand.token0,
+                    cand.token1,
+                )
+                continue
+            price_vals = [p for _, p in prices if p > 0]
+            if len(price_vals) < 2:
+                continue
+            low = min(price_vals)
+            high = max(price_vals)
+            if low <= 0:
+                continue
+            spread_bps = float(((high - low) / low) * Decimal(10_000))
+            if spread_bps < min_validation_spread_bps:
+                log.info(
+                    "[event-filter] Candidate rejected (spread %.2f bps < %.2f bps) pair=%s/%s",
+                    spread_bps,
+                    min_validation_spread_bps,
+                    cand.token0,
+                    cand.token1,
+                )
+                continue
+            log.info(
+                "[event-filter] Candidate validated pair=%s/%s spread=%.2f bps",
+                cand.token0,
+                cand.token1,
+                spread_bps,
+            )
+            validated.append(cand)
+            validated_event_tokens.update([cand.token0.lower(), cand.token1.lower()])
+        return validated
+
+    if filter_mode == "event" and event_candidates:
+        event_candidates = _validate_event_candidates()
+        if validated_event_tokens:
+            candidate_tokens_from_events = validated_event_tokens
+        if not event_candidates and fallback_on_empty == "skip":
+            log.info("[event-filter] No validated candidates; skipping tick")
+            return
 
     # Build multi-DEX pair map for cross-DEX routing
     pair_dex_map: Dict[tuple[str, str], Set[str]] = {}
